@@ -19,7 +19,11 @@ class SQLToken:
 class RiverFormatter:
     def __init__(self):
         self.primary_river_pos = 0
+        self.secondary_river_pos = 0
         self.left_clauses = []
+        self.secondary_clauses = []  # CASE, WHEN, THEN, ELSE, END for secondary river
+        self.cte_structure = []  # Track CTE structure: [{'name': 'cte1', 'start_line': 1, 'end_line': 5}, ...]
+        self.subquery_depth = 0  # Track nesting depth of subqueries
         
         # Extended LEFT CLAUSE patterns
         self.left_clause_patterns = [
@@ -43,6 +47,9 @@ class RiverFormatter:
             r'\bCREATE\s+TEMP\s+TABLE\b', r'\bCREATE\s+TABLE\b',
             r'\bINSERT\s+INTO\b', r'\bUPDATE\b', r'\bSET\b', r'\bDELETE\b',
             
+            # Comments
+            r'--\s*,', r'--\s*\b(?:SELECT|FROM|WHERE|GROUP\s+BY|HAVING|ORDER\s+BY|LIMIT|JOIN|LEFT\s+JOIN|RIGHT\s+JOIN|INNER\s+JOIN|FULL\s+JOIN|CROSS\s+JOIN|UNION|WITH|AS|INSERT\s+INTO|UPDATE|SET|DELETE|DECLARE|DO)\b', r'--',
+            
             # Other
             r'\bDECLARE\b', r'\bDO\b',
         ]
@@ -53,32 +60,79 @@ class RiverFormatter:
             r'^\s*AND\b', r'^\s*OR\b',  # Logical operators
         ]
         
+        # Secondary river patterns (CASE statements)
+        self.secondary_clause_patterns = [
+            r'\bCASE\b', r'\bWHEN\b', r'\bTHEN\b', r'\bELSE\b', r'\bEND\b'
+        ]
+        
     def format_sql(self, sql: str) -> str:
         """Main entry point for SQL formatting"""
         if not sql.strip():
             return sql
             
-        # Step 1: Global scan to find all LEFT CLAUSES
+        # Step 1: Analyze CTE structure
+        self._analyze_cte_structure(sql)
+        
+        # Step 2: Global scan to find all LEFT CLAUSES
         self._extract_all_left_clauses(sql)
         
-        # Step 2: Calculate primary river line position
-        self._calculate_primary_river()
+        # Step 3: Extract secondary clauses
+        self._extract_secondary_clauses(sql)
         
-        # Step 3: Format the SQL
+        # Step 4: Calculate primary and secondary river line positions
+        self._calculate_primary_river()
+        self._calculate_secondary_river()
+        
+        # Step 5: Format the SQL
         formatted = self._format_with_river(sql)
         
         return formatted
+    
+    def _analyze_cte_structure(self, sql: str):
+        """Analyze CTE structure to identify boundaries and nesting"""
+        self.cte_structure = []
+        
+        # Remove comments for accurate analysis
+        sql_clean = self._remove_comments(sql)
+        # For single-line SQL with multiple CTEs, use regex to find CTE boundaries
+        cte_pattern = r'\bWITH\s+(\w+)\s+AS\s*\([^)]*\)(?:\s*,\s*(\w+)\s+AS\s*\([^)]*\))*'
+        
+        # Find all CTE definitions
+        cte_matches = list(re.finditer(r'(\w+)\s+AS\s*(\([^)]+\))', sql_clean, re.IGNORECASE))
+        
+        if cte_matches:
+            for i, match in enumerate(cte_matches):
+                cte_name = match.group(1).upper()
+                cte_content = match.group(2)
+                
+                # Add CTE to structure
+                self.cte_structure.append({
+                    'name': cte_name,
+                    'start_line': 1,  # All on same line for single-line SQL
+                    'end_line': 1,
+                    'has_parentheses': True
+                })
+            
+            # Check if there's a main query after CTEs
+            # Find the position after the last CTE
+            if cte_matches:
+                last_match = cte_matches[-1]
+                remaining_sql = sql_clean[last_match.end():].strip()
+                if re.search(r'\bSELECT\b', remaining_sql, re.IGNORECASE):
+                    self.cte_structure.append({
+                        'name': 'MAIN_QUERY',
+                        'start_line': 1,
+                        'end_line': 1,
+                        'has_parentheses': False
+                    })
     
     def _extract_all_left_clauses(self, sql: str):
         """Extract all LEFT CLAUSES from entire input to calculate global river"""
         self.left_clauses = []
         
-        # Remove comments first for accurate pattern matching
-        sql_clean = self._remove_comments(sql)
-        
-        # Find all LEFT CLAUSE patterns
+        # First, find all LEFT CLAUSE patterns (including comments)
         for pattern in self.left_clause_patterns:
-            matches = re.finditer(pattern, sql_clean, re.IGNORECASE)
+            matches = re.finditer(pattern, sql, re.IGNORECASE)
             for match in matches:
                 clause = match.group().strip()
                 # Normalize whitespace in multi-word clauses
@@ -86,8 +140,8 @@ class RiverFormatter:
                 if clause not in self.left_clauses:
                     self.left_clauses.append(clause)
         
-        # Also check for continuation commas and operators
-        lines = sql_clean.split('\n')
+        # Also check for continuation commas and operators in each line
+        lines = sql.split('\n')
         for line in lines:
             line = line.strip()
             if line.startswith(','):
@@ -96,6 +150,24 @@ class RiverFormatter:
                 parts = line.split(None, 1)
                 if parts:
                     self.left_clauses.append(parts[0])
+            elif line.startswith('--'):
+                # Check for comment patterns
+                if re.match(r'^--\s*,', line):
+                    comment_clause = '-- ,'
+                    if comment_clause not in self.left_clauses:
+                        self.left_clauses.append(comment_clause)
+                elif re.match(r'^--\s*\b(?:SELECT|FROM|WHERE|GROUP\s+BY|HAVING|ORDER\s+BY|LIMIT|INNER\s+JOIN|LEFT\s+JOIN|RIGHT\s+JOIN|FULL\s+OUTER\s+JOIN|LEFT\s+OUTER\s+JOIN|RIGHT\s+OUTER\s+JOIN|FULL\s+JOIN|CROSS\s+JOIN|JOIN|UNION\s+ALL|UNION|WITH|AS|CREATE\s+TEMP\s+TABLE|CREATE\s+TABLE|INSERT\s+INTO|UPDATE|SET|DELETE|DECLARE|DO)\b', line, re.IGNORECASE):
+                    # Extract the comment + keyword as a clause
+                    match = re.match(r'^--\s*(\b(?:SELECT|FROM|WHERE|GROUP\s+BY|HAVING|ORDER\s+BY|LIMIT|INNER\s+JOIN|LEFT\s+JOIN|RIGHT\s+JOIN|FULL\s+OUTER\s+JOIN|LEFT\s+OUTER\s+JOIN|RIGHT\s+OUTER\s+JOIN|FULL\s+JOIN|CROSS\s+JOIN|JOIN|UNION\s+ALL|UNION|WITH|AS|CREATE\s+TEMP\s+TABLE|CREATE\s+TABLE|INSERT\s+INTO|UPDATE|SET|DELETE|DECLARE|DO)\b)', line, re.IGNORECASE)
+                    if match:
+                        keyword = match.group(1).upper()
+                        comment_clause = f'-- {keyword}'
+                        if comment_clause not in self.left_clauses:
+                            self.left_clauses.append(comment_clause)
+                else:
+                    # Just comment
+                    if '--' not in self.left_clauses:
+                        self.left_clauses.append('--')
     
     def _remove_comments(self, sql: str) -> str:
         """Remove SQL comments for pattern matching"""
@@ -117,21 +189,485 @@ class RiverFormatter:
         max_clause_length = max(len(clause) for clause in self.left_clauses)
         self.primary_river_pos = 7 + max_clause_length
     
+    def _extract_secondary_clauses(self, sql: str):
+        """Extract secondary clauses for both CASE and subquery contexts"""
+        self.secondary_clauses = []
+        
+        # For CASE statements: extract CASE WHEN as compound clause
+        case_when_pattern = r'\bCASE\s+WHEN\b'
+        case_when_matches = re.finditer(case_when_pattern, sql, re.IGNORECASE)
+        for match in case_when_matches:
+            clause = 'CASE WHEN'
+            if clause not in self.secondary_clauses:
+                self.secondary_clauses.append(clause)
+        
+        # For subqueries: extract SELECT and other SQL clauses within parentheses
+        # This is a simplified approach - could be enhanced with proper parentheses parsing
+        subquery_patterns = [r'\(\s*SELECT\b', r'\(\s*FROM\b', r'\(\s*WHERE\b']
+        for pattern in subquery_patterns:
+            matches = re.finditer(pattern, sql, re.IGNORECASE)
+            for match in matches:
+                # Extract the clause part (e.g., "SELECT" from "(SELECT")
+                clause_match = re.search(r'\b(SELECT|FROM|WHERE)\b', match.group(), re.IGNORECASE)
+                if clause_match:
+                    clause = clause_match.group().upper()
+                    if clause not in self.secondary_clauses:
+                        self.secondary_clauses.append(clause)
+        
+        # Also add other secondary patterns
+        for pattern in self.secondary_clause_patterns:
+            matches = re.finditer(pattern, sql, re.IGNORECASE)
+            for match in matches:
+                clause = match.group().strip().upper()
+                if clause not in self.secondary_clauses:
+                    self.secondary_clauses.append(clause)
+    
+    def _calculate_secondary_river(self):
+        """Calculate secondary river line position"""
+        if not self.secondary_clauses:
+            # Default: primary + 10 for CASE contexts (includes river space)
+            self.secondary_river_pos = self.primary_river_pos + 10
+            return
+        
+        # Find the maximum length of secondary clauses
+        max_secondary_length = max(len(clause) for clause in self.secondary_clauses)
+        
+        # Check if we have CASE WHEN (CASE context)
+        has_case_when = 'CASE WHEN' in self.secondary_clauses
+        
+        if has_case_when:
+            # CASE context: primary + 1 (for primary river space) + 9 (gap) = primary + 10
+            self.secondary_river_pos = self.primary_river_pos + 10
+        else:
+            # Subquery context: primary + 1 (for primary river space) + proper gap
+            # For subqueries, use max secondary clause length + 3 margin + 1 for river space
+            self.secondary_river_pos = self.primary_river_pos + max_secondary_length + 4
+    
     def _format_with_river(self, sql: str) -> str:
         """Format SQL using calculated river line - preserve all original tokens"""
-        # First, split the SQL into logical formatting lines
-        logical_lines = self._split_into_logical_lines(sql)
+        # First, split by actual lines, then process each line for logical formatting
+        input_lines = sql.split('\n')
+        logical_lines = []
+        
+        for line in input_lines:
+            if line.strip().startswith('--'):
+                # Comment line - keep as is
+                logical_lines.append(line.strip())
+            else:
+                # SQL line - split into logical parts
+                sql_logical = self._split_into_logical_lines(line)
+                logical_lines.extend(sql_logical)
         
         formatted_lines = []
-        for logical_line in logical_lines:
+        line_num = 0
+        
+        # Track parentheses context for subquery detection
+        paren_depth = 0
+        in_subquery = False
+        
+        i = 0
+        while i < len(logical_lines):
+            line_num += 1
+            logical_line = logical_lines[i]
+            
             if not logical_line.strip():
                 formatted_lines.append('')
+                i += 1
                 continue
             
-            formatted_line = self._format_line_preserving_tokens(logical_line.strip())
-            formatted_lines.append(formatted_line)
+            # Check for WHEN THEN combination patterns
+            current_upper = logical_line.strip().upper()
+            
+            # Debug output for combination logic (disabled)
+            # if 'CASE' in current_upper or 'WHEN' in current_upper or 'THEN' in current_upper:
+            #     print(f"DEBUG: Line {i}: {repr(logical_line)} -> {repr(current_upper)}")
+            #     if i + 1 < len(logical_lines):
+            #         next_upper = logical_lines[i + 1].strip().upper() 
+            #         print(f"DEBUG: Next {i+1}: {repr(logical_lines[i + 1])} -> {repr(next_upper)}")
+            
+            # Pattern 1: WHEN ... followed by line starting with THEN
+            if (current_upper.startswith('WHEN ') and 
+                i + 1 < len(logical_lines) and 
+                logical_lines[i + 1].strip().upper().startswith('THEN ')):
+                
+                # Combine WHEN and THEN into single line
+                when_part = logical_line.strip()
+                then_part = logical_lines[i + 1].strip()
+                combined_line = f"{when_part} {then_part}"
+                
+                # Format the combined line
+                formatted_line = self._format_case_clause(combined_line)
+                formatted_lines.append(formatted_line)
+                i += 2  # Skip both WHEN and THEN lines
+                continue
+            
+            # Pattern 2: CASE WHEN followed by line starting with THEN (including comma-first)
+            elif ((current_upper.startswith('CASE WHEN ') or current_upper.startswith(', CASE WHEN ')) and 
+                  i + 1 < len(logical_lines) and 
+                  logical_lines[i + 1].strip().upper().startswith('THEN ')):
+                
+                # Debug output (disabled)
+                # print(f"DEBUG: Pattern 2 matched - {repr(logical_line)} + {repr(logical_lines[i + 1])}")
+                
+                # Combine CASE WHEN and THEN into single line
+                case_when_part = logical_line.strip()
+                then_part = logical_lines[i + 1].strip()
+                combined_line = f"{case_when_part} {then_part}"
+                
+                # Format the combined line as CASE clause
+                formatted_line = self._format_case_clause(combined_line)
+                formatted_lines.append(formatted_line)
+                i += 2  # Skip both CASE WHEN and THEN lines
+                continue
+            
+            # Pattern 3: CASE WHEN (keywords only) followed by condition ending with THEN
+            elif (current_upper == 'CASE WHEN' and 
+                  i + 1 < len(logical_lines) and 
+                  logical_lines[i + 1].strip().upper().endswith(' THEN')):
+                
+                # Combine CASE WHEN keywords with condition + THEN
+                case_when_keywords = logical_line.strip()
+                condition_then = logical_lines[i + 1].strip()
+                combined_line = f"{case_when_keywords} {condition_then}"
+                
+                # Format the combined line as CASE clause  
+                formatted_line = self._format_case_clause(combined_line)
+                formatted_lines.append(formatted_line)
+                i += 2  # Skip both lines
+                continue
+            
+            # Pattern 4: WHEN (keyword only) followed by condition ending with THEN
+            elif (current_upper == 'WHEN' and 
+                  i + 1 < len(logical_lines) and 
+                  logical_lines[i + 1].strip().upper().endswith(' THEN')):
+                
+                # Combine WHEN keyword with condition + THEN
+                when_keyword = logical_line.strip()
+                condition_then = logical_lines[i + 1].strip()
+                combined_line = f"{when_keyword} {condition_then}"
+                
+                # Format the combined line as CASE clause
+                formatted_line = self._format_case_clause(combined_line)
+                formatted_lines.append(formatted_line)
+                i += 2  # Skip both lines
+                continue
+            
+            current_line = logical_line.strip()
+            
+            # Store current subquery context for formatting this line
+            format_in_subquery = in_subquery
+            
+            # Update parentheses context tracking for next lines
+            # Check for opening parentheses (including in combined lines like "FROM (")
+            if '(' in current_line:
+                paren_count = current_line.count('(')
+                paren_depth += paren_count
+                if paren_depth > 0:
+                    in_subquery = True
+            
+            # Check for closing parentheses
+            if ')' in current_line:
+                paren_count = current_line.count(')')
+                paren_depth -= paren_count
+                if paren_depth <= 0:
+                    in_subquery = False
+                    paren_depth = 0  # Don't go negative
+            
+            # Check for closing parenthesis followed by semicolon pattern
+            if (logical_line.strip() == ')' and 
+                i + 1 < len(logical_lines) and 
+                logical_lines[i + 1].strip() == ';'):
+                
+                # Combine ) and ; on the same line
+                close_paren_pos = self.primary_river_pos + 1
+                formatted_line = f"{' ' * close_paren_pos});"
+                formatted_lines.append(formatted_line)
+                i += 2  # Skip both ) and ; lines
+                continue
+            
+            # Check if this line needs CTE bracket processing
+            formatted_line = self._process_cte_brackets(logical_line.strip(), line_num)
+            if formatted_line is None:
+                # Check for CASE formatting
+                if self._is_case_line(logical_line.strip()):
+                    formatted_line = self._format_case_clause(logical_line.strip())
+                else:
+                    # Standard formatting - pass subquery context
+                    formatted_line = self._format_line_preserving_tokens(logical_line.strip(), format_in_subquery)
+                formatted_lines.append(formatted_line)
+            else:
+                # CTE bracket processing returned multiple lines
+                bracket_lines = formatted_line.split('\n')
+                formatted_lines.extend(bracket_lines)
+            
+            i += 1
+        
+        # Insert blank lines between CTEs and before main query
+        formatted_lines = self._insert_cte_blank_lines(formatted_lines)
         
         return '\n'.join(formatted_lines)
+    
+    def _process_cte_brackets(self, line: str, line_num: int) -> Optional[str]:
+        """Process CTE bracket formatting - opening bracket on same line as AS, closing bracket positioning"""
+        # Check if this line contains AS ( or AS(
+        if re.search(r'\bAS\s*\(', line, re.IGNORECASE):
+            # Split at AS( or AS (
+            parts = re.split(r'(\bAS)\s*\(', line, 1, re.IGNORECASE)
+            if len(parts) >= 3:
+                before_as = parts[0].strip()
+                as_part = parts[1].strip()
+                after_paren = parts[2].strip()
+                
+                # Format: "WITH cte_name AS (" on same line
+                result_lines = []
+                
+                # First line: WITH cte_name AS (
+                as_clause_with_paren = f"{before_as} {as_part} (".strip()
+                formatted_as = self._format_line_preserving_tokens(as_clause_with_paren)
+                result_lines.append(formatted_as)
+                
+                # Second line: content after opening parenthesis (if any)
+                if after_paren:
+                    formatted_content = self._format_line_preserving_tokens(after_paren)
+                    result_lines.append(formatted_content)
+                
+                return '\n'.join(result_lines)
+        
+        # Check if this line is a closing bracket for CTE
+        if line.strip() == ')':
+            # Position closing bracket at river + 1
+            close_paren_pos = self.primary_river_pos + 1
+            return f"{' ' * close_paren_pos})"
+        
+        # Check if line ends with closing bracket
+        if line.strip().endswith(')') and len(line.strip()) > 1:
+            # Split content and closing bracket
+            content = line.strip()[:-1].strip()
+            if content:
+                result_lines = []
+                # Content line
+                formatted_content = self._format_line_preserving_tokens(content)
+                result_lines.append(formatted_content)
+                # Closing bracket line
+                close_paren_pos = self.primary_river_pos + 1
+                result_lines.append(f"{' ' * close_paren_pos})")
+                return '\n'.join(result_lines)
+        
+        return None  # No special bracket processing needed
+    
+    def _insert_cte_blank_lines(self, formatted_lines: List[str]) -> List[str]:
+        """Insert blank lines between CTEs and before main query"""
+        if not self.cte_structure or len(self.cte_structure) <= 1:
+            return formatted_lines
+        
+        result_lines = []
+        
+        for i, line in enumerate(formatted_lines):
+            # Add the current line
+            result_lines.append(line)
+            
+            # Check if this line ends a CTE (closing bracket at river+1 position)
+            if line.strip() == ')':
+                expected_pos = self.primary_river_pos + 1
+                actual_pos = len(line) - len(line.lstrip())
+                
+                if actual_pos == expected_pos:
+                    # Look ahead to see what comes next (skip empty lines)
+                    next_non_empty_line = None
+                    for j in range(i + 1, len(formatted_lines)):
+                        if formatted_lines[j].strip():
+                            next_non_empty_line = formatted_lines[j]
+                            break
+                    
+                    # If next line starts with comma (next CTE) or SELECT/other main clauses (main query)
+                    if next_non_empty_line:
+                        # Strip leading spaces to check if it starts with comma
+                        stripped_next = next_non_empty_line.lstrip()
+                        if (stripped_next.startswith(',') or 
+                            any(stripped_next.upper().startswith(clause) 
+                                for clause in ['SELECT', 'INSERT', 'UPDATE', 'DELETE'])):
+                            result_lines.append('')  # Add blank line after CTE end
+        
+        return result_lines
+    
+    def _format_comment_line(self, line: str) -> str:
+        """Format comment lines with proper indentation"""
+        # Normalize multiple spaces after -- to single space
+        comment_content = re.sub(r'^--\s*', '-- ', line)
+        
+        # Check for comment with SQL keywords (-- SELECT, -- JOIN, etc.)
+        comment_clause_patterns = [
+            (r'^--\s*,', '-- ,'),  # Comment comma
+            (r'^--\s*(SELECT|FROM|WHERE|GROUP\s+BY|HAVING|ORDER\s+BY|LIMIT|INNER\s+JOIN|LEFT\s+JOIN|RIGHT\s+JOIN|FULL\s+OUTER\s+JOIN|LEFT\s+OUTER\s+JOIN|RIGHT\s+OUTER\s+JOIN|FULL\s+JOIN|CROSS\s+JOIN|JOIN|UNION\s+ALL|UNION|WITH|AS|CREATE\s+TEMP\s+TABLE|CREATE\s+TABLE|INSERT\s+INTO|UPDATE|SET|DELETE|DECLARE|DO)\b', '-- {keyword}')
+        ]
+        
+        for pattern, template in comment_clause_patterns:
+            match = re.match(pattern, comment_content, re.IGNORECASE)
+            if match:
+                if '{keyword}' in template:
+                    keyword = match.group(1).upper()
+                    clause = f"-- {keyword}"
+                else:
+                    clause = template
+                
+                # Find remaining content after the keyword
+                keyword_end = match.end()
+                remaining = comment_content[keyword_end:].strip()
+                
+                clause_pos = self.primary_river_pos - len(clause)
+                if remaining:
+                    return f"{' ' * clause_pos}{clause} {remaining}"
+                else:
+                    return f"{' ' * clause_pos}{clause}"
+        
+        # Default comment (-- explanation text)
+        clause = '--'
+        remaining = comment_content[2:].strip()
+        clause_pos = self.primary_river_pos - len(clause)
+        if remaining:
+            return f"{' ' * clause_pos}{clause} {remaining}"
+        else:
+            return f"{' ' * clause_pos}{clause}"
+    
+    def _is_case_clause(self, line: str) -> bool:
+        """Check if line contains CASE statement clauses"""
+        for pattern in self.secondary_clause_patterns:
+            if re.match(pattern, line, re.IGNORECASE):
+                return True
+        return False
+    
+    def _format_case_clause(self, line: str) -> str:
+        """Format CASE statement clauses using secondary river"""
+        # Handle combined CASE WHEN THEN lines (comma-first)
+        comma_case_match = re.match(r'(,\s*CASE\s+WHEN\s+.*?)\s+(THEN\s+.*)', line, re.IGNORECASE)
+        if comma_case_match:
+            comma_case_when_part = comma_case_match.group(1).strip()
+            then_part = comma_case_match.group(2).strip()
+            # Handle comma-first formatting
+            comma_pos = self.primary_river_pos - 1  
+            content_pos = self.primary_river_pos + 1
+            # Extract just the CASE WHEN part without comma
+            case_when_part = comma_case_when_part[1:].strip()  # Remove comma
+            return f"{' ' * comma_pos},{' ' * (content_pos - comma_pos - 1)}{case_when_part} {then_part}"
+        
+        # Handle combined CASE WHEN THEN lines (non-comma)
+        case_when_then_match = re.match(r'(CASE\s+WHEN\s+.*?)\s+(THEN\s+.*)', line, re.IGNORECASE)
+        if case_when_then_match:
+            case_when_part = case_when_then_match.group(1).strip()
+            then_part = case_when_then_match.group(2).strip()
+            # Position CASE at primary river, rest follows naturally
+            case_pos = self.primary_river_pos - 4  # len('CASE')
+            return f"{' ' * max(0, case_pos)}{case_when_part} {then_part}"
+        
+        # Handle combined WHEN THEN lines
+        when_then_match = re.match(r'(WHEN\s+.*?)\s+(THEN\s+.*)', line, re.IGNORECASE)
+        if when_then_match:
+            when_part = when_then_match.group(1).strip()
+            then_part = when_then_match.group(2).strip()
+            # Position WHEN at secondary river, THEN follows naturally
+            when_pos = self.secondary_river_pos - 4  # len('WHEN')
+            return f"{' ' * max(0, when_pos)}{when_part} {then_part}"
+        
+        # Handle individual CASE clauses
+        for pattern in self.secondary_clause_patterns:
+            match = re.match(pattern, line, re.IGNORECASE)
+            if match:
+                clause = match.group().strip().upper()
+                remaining = line[len(match.group()):].strip()
+                
+                # Special handling for different CASE clauses
+                if clause == 'CASE':
+                    # CASE gets normal LEFT_CLAUSE positioning (primary river)
+                    clause_pos = self.primary_river_pos - len(clause)
+                elif clause in ['WHEN', 'THEN', 'ELSE']:
+                    # WHEN/THEN/ELSE use secondary river positioning
+                    # Secondary river = primary + 9 (fixed for CASE context)
+                    clause_pos = self.secondary_river_pos - len(clause)
+                elif clause == 'END':
+                    # END positioned at secondary river (aligned with WHEN/THEN/ELSE)
+                    clause_pos = self.secondary_river_pos - len(clause)
+                else:
+                    # Default secondary river position
+                    clause_pos = self.secondary_river_pos - len(clause)
+                
+                if remaining:
+                    return f"{' ' * max(0, clause_pos)}{clause} {remaining}"
+                else:
+                    return f"{' ' * max(0, clause_pos)}{clause}"
+        
+        # Fallback to standard formatting
+        return self._format_line_preserving_tokens(line)
+    
+    def _is_subquery_line(self, line: str) -> bool:
+        """Check if line contains subquery patterns"""
+        # Look for (SELECT pattern - main indicator
+        if re.search(r'\(\s*SELECT\b', line, re.IGNORECASE):
+            return True
+        
+        # Don't treat other clauses as subquery unless they have clear subquery indicators
+        return False
+    
+    def _is_case_line(self, line: str) -> bool:
+        """Check if line is part of a CASE statement"""
+        case_keywords = ['CASE', 'WHEN', 'THEN', 'ELSE', 'END']
+        line_upper = line.strip().upper()
+        
+        for keyword in case_keywords:
+            if line_upper.startswith(keyword + ' ') or line_upper == keyword:
+                return True
+        
+        # Also check for CASE WHEN
+        if re.match(r'\bCASE\s+WHEN\b', line, re.IGNORECASE):
+            return True
+            
+        return False
+    
+    def _in_parentheses_context(self, line: str) -> bool:
+        """Check if we're inside parentheses context (simplified check)"""
+        # This is a simplified implementation - could be enhanced
+        return False  # For now, rely on (SELECT pattern
+    
+    def _format_subquery_line(self, line: str) -> str:
+        """Format subquery lines with nested indentation"""
+        # Handle opening parenthesis with SELECT
+        if re.search(r'\(\s*SELECT\b', line, re.IGNORECASE):
+            # Split into parts: before (, SELECT, after SELECT
+            match = re.search(r'(.*?)\(\s*(SELECT\b)(.*)', line, re.IGNORECASE)
+            if match:
+                before_paren = match.group(1).strip()
+                select_keyword = match.group(2).upper()
+                after_select = match.group(3).strip()
+                
+                result_lines = []
+                
+                # Format the part before ( if it exists
+                if before_paren:
+                    before_formatted = self._format_line_preserving_tokens(before_paren)
+                    result_lines.append(before_formatted)
+                
+                # Add opening parenthesis at river + 1
+                paren_pos = self.primary_river_pos + 1
+                result_lines.append(f"{' ' * paren_pos}(")
+                
+                # Format SELECT with secondary river positioning
+                if self.secondary_river_pos:
+                    select_pos = self.secondary_river_pos - len(select_keyword)
+                    if after_select:
+                        select_line = f"{' ' * max(0, select_pos)}{select_keyword} {after_select}"
+                    else:
+                        select_line = f"{' ' * max(0, select_pos)}{select_keyword}"
+                else:
+                    # Fallback to standard formatting
+                    if after_select:
+                        select_line = self._format_line_preserving_tokens(f"{select_keyword} {after_select}")
+                    else:
+                        select_line = self._format_line_preserving_tokens(select_keyword)
+                
+                result_lines.append(select_line)
+                return '\n'.join(result_lines)
+        
+        # Fallback to standard formatting
+        return self._format_line_preserving_tokens(line)
     
     def _split_into_logical_lines(self, sql: str) -> List[str]:
         """Split SQL into logical lines for comma-first formatting"""
@@ -178,7 +714,7 @@ class RiverFormatter:
                     current_tokens = []
                 lines.append(';')
                 
-            elif token.upper() in ['SELECT', 'FROM', 'WHERE', 'GROUP', 'BY', 'ORDER', 'HAVING', 'UNION', 'AND', 'OR']:
+            elif token.upper() in ['SELECT', 'FROM', 'WHERE', 'GROUP', 'BY', 'ORDER', 'HAVING', 'UNION', 'AND', 'OR'] or token.startswith('--'):
                 # Check for compound keywords
                 if token.upper() in ['GROUP', 'ORDER', 'UNION'] and i < len(sql):
                     # Look ahead for BY/ALL
@@ -225,7 +761,7 @@ class RiverFormatter:
             
         return lines
     
-    def _format_line_preserving_tokens(self, line: str) -> str:
+    def _format_line_preserving_tokens(self, line: str, in_subquery: bool = False) -> str:
         """Format a single line while preserving all original tokens"""
         if not line:
             return ''
@@ -234,17 +770,25 @@ class RiverFormatter:
         if line.strip().upper().startswith('SELECT '):
             # Extract SELECT and first item only
             content = line.strip()[7:]  # Remove "SELECT "
+            
+            # Choose river position based on context
+            if (in_subquery and self.secondary_river_pos and 
+                'SELECT' in self.secondary_clauses and 'CASE WHEN' in self.secondary_clauses):
+                # Use secondary river positioning for subquery SELECT
+                river_pos = self.secondary_river_pos
+            else:
+                # Use primary river positioning for main query SELECT
+                river_pos = self.primary_river_pos
+                
+            select_pos = river_pos - len('SELECT')
+            
             if ',' in content:
                 # Has multiple items - take only first
                 first_item = content.split(',')[0].strip()
-                river_pos = self.primary_river_pos
-                select_pos = river_pos - len('SELECT')
-                return f"{' ' * select_pos}SELECT {first_item}"
+                return f"{' ' * max(0, select_pos)}SELECT {first_item}"
             else:
                 # Single item or no items
-                river_pos = self.primary_river_pos  
-                select_pos = river_pos - len('SELECT')
-                return f"{' ' * select_pos}SELECT {content}"
+                return f"{' ' * max(0, select_pos)}SELECT {content}"
         
         # Handle comma-first lines
         if line.strip().startswith(','):
@@ -258,17 +802,39 @@ class RiverFormatter:
             spaces_after_comma = content_pos - comma_pos - 1  # 14 - 12 - 1 = 1 space
             return f"{' ' * comma_pos},{' ' * spaces_after_comma}{content}"
         
-        # Handle other LEFT_CLAUSE patterns
+        # Handle comment lines
+        if line.strip().startswith('--'):
+            return self._format_comment_line(line.strip())
+        
+        # Handle CASE statement clauses
+        if self._is_case_clause(line.strip()):
+            return self._format_case_clause(line.strip())
+        
+        # Handle subquery patterns (SELECT within parentheses)
+        if self._is_subquery_line(line.strip()):
+            return self._format_subquery_line(line.strip())
+        
+        # Handle other LEFT_CLAUSE patterns with subquery context awareness
         for pattern in self.left_clause_patterns:
             match = re.match(pattern, line.strip(), re.IGNORECASE)
             if match:
                 clause = match.group().strip()
                 remaining = line.strip()[len(clause):].strip()
-                clause_pos = self.primary_river_pos - len(clause)
-                if remaining:
-                    return f"{' ' * clause_pos}{clause} {remaining}"
+                
+                # Use secondary river positioning if in subquery context and we have both contexts
+                if (in_subquery and self.secondary_river_pos and 
+                    'SELECT' in self.secondary_clauses and 'CASE WHEN' in self.secondary_clauses and
+                    clause.upper() in ['SELECT', 'FROM', 'WHERE', 'GROUP BY', 'ORDER BY', 'HAVING']):
+                    # Use secondary river positioning for subquery clauses
+                    clause_pos = self.secondary_river_pos - len(clause)
                 else:
-                    return f"{' ' * clause_pos}{clause}"
+                    # Use primary river positioning for main query clauses
+                    clause_pos = self.primary_river_pos - len(clause)
+                
+                if remaining:
+                    return f"{' ' * max(0, clause_pos)}{clause} {remaining}"
+                else:
+                    return f"{' ' * max(0, clause_pos)}{clause}"
         
         # Handle AND/OR
         if line.strip().upper().startswith('AND ') or line.strip().upper().startswith('OR '):
@@ -613,7 +1179,6 @@ class RiverFormatter:
             
         elif has_comma:
             # Comma-first pattern: , content
-            comma = next(t for t in token_group if t['type'] == 'COMMA')
             right_sentences = [t for t in token_group if t['type'] == 'RIGHT_SENTENCE']
             
             # Position comma at river-2
@@ -661,7 +1226,9 @@ class RiverFormatter:
         for line_num, line in enumerate(lines, 1):
             if len(line) > self.primary_river_pos:
                 char_at_river = line[self.primary_river_pos]
-                if char_at_river != ' ':
+                # River position should always have space, except in CASE statement contexts
+                is_case_context = any(clause_word in line.upper() for clause_word in ['WHEN ', 'THEN ', 'ELSE ', 'END '])
+                if char_at_river != ' ' and not is_case_context:
                     print(f"River line verification failed at line {line_num}")
                     print(f"Expected space at position {self.primary_river_pos}, found: '{char_at_river}'")
                     print(f"Line: '{line}'")
